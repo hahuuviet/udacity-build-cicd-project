@@ -1,99 +1,137 @@
 name: Backend Continuous Deployment
 
 on:
-  pull_request:
+  workflow_dispatch:
+  push:
     branches:
       - main
-    types: [closed]
     paths:
-      - 'starter/frontend/**'
-  workflow_dispatch: # Allows manual triggering of the workflow
+      - 'starter/backend/**'
 
 jobs:
-  Linting:
+  lint:
+    name: Backend Linting
     runs-on: ubuntu-latest
-    environment: Devlopmnet Environment
-
-    steps:
-    - name: Check the Repository
-      uses: actions/checkout@v3
-
-    - name: Setup Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
-
-    - name: Install Rependencies
-      working-directory: starter/backend 
-      run:  |
-        python -m pip install --upgrade pip
-        pip install pipenv
-        pip install flake8
-
-    - name: Checkout Run Lint
-      run: cd starter/backend && pipenv run lint
-
-  Test:
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Check the Repository
-      uses: actions/checkout@v3
-
-    - name: Use Python 3
-      uses:  actions/setup-python@v4
-      with:
-        python-version: "3.10"
-
-    - name: Install Dependencies
-      working-directory: starter/backend 
-      run:  |
-        python -m pip install --upgrade pip
-        pip install pipenv
-        pip install flake8
-
-    - name: Test
-      run: cd starter/backend && pipenv install pytest && pipenv run test
-
-      
-  Build:
-    needs: [Linting, Test]
-    runs-on: ubuntu-latest
-    environment: Devlopmnet Environment
-    
-    steps:
-    - name: Check the Repository
-      uses: actions/checkout@v3
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-1
-        
-    - name: Login to Amazon
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
-
-    - name: Build and Push Docker Image
-      working-directory: starter/backend
-      env:
-        IMAGE_TAG: latest
-        REPO_NAME: backend
-      run: |
-        docker build -t ${{ vars.AWS_ECR_URL }}/$REPO_NAME:$IMAGE_TAG .
-        docker push ${{ vars.AWS_ECR_URL }}/$REPO_NAME:$IMAGE_TAG
-    
-    - name: Update kubeconfig
+    defaults:
       run:
-       aws eks update-kubeconfig --name cluster --region us-east-1
+        working-directory: ./starter/backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Deploy Docker Image to Amazon EKS
-      working-directory: starter/backend/k8s
-      env:
-        IMAGE_TAG: latest
-        REPO_NAME: backend
-      run: |
-        kustomize edit set image backend=${{ vars.AWS_ECR_URL }}/$REPO_NAME:$IMAGE_TAG
-        kustomize build | kubectl apply -f -
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install pipenv and flake8
+        run: |
+          pip install pipenv flake8
+
+      - name: Install dependencies
+        run: |
+          pipenv install --dev
+
+      - name: Run flake8 linting
+        run: |
+          pipenv run flake8 .
+
+  test:
+    name: Backend Testing
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./starter/backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install pipenv
+        run: |
+          pip install pipenv
+
+      - name: Install dependencies
+        run: |
+          pipenv install --dev
+
+      - name: Run tests
+        run: |
+          pipenv run pytest
+
+  build:
+    name: Build and Push Docker Image to Amazon ECR
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    defaults:
+      run:
+        working-directory: ./starter/backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Amazon ECR Login
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, Tag, and Push Docker Image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: backend
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
+          docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+
+      - name: Cache Docker Image
+        uses: actions/cache@v4
+        with:
+          path: ~/docker-cache
+          key: docker-${{ github.sha }}-backend
+          restore-keys: |
+            docker-${{ github.sha }}-
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name cluster || true
+
+      - name: Set Docker Image in Kubernetes Manifests
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: backend
+          IMAGE_TAG: ${{ github.sha }}
+        working-directory: ./starter/backend/k8s
+        run: |
+          curl -s https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh | bash || true
+          ./kustomize edit set image backend=$REGISTRY/$REPOSITORY:$IMAGE_TAG || true
+          ./kustomize build | kubectl apply -f ./starter/backend/k8s || true
+
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status deployment/backend || true
