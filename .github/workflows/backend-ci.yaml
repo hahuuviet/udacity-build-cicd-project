@@ -13,7 +13,7 @@ env:
 
 jobs:
   lint:
-    name: Backend run lint
+    name: Backend Linting
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -34,20 +34,17 @@ jobs:
         with:
           python-version: ${{env.PYTHON_VERSION}}
 
-      - name: Install pipenv
+      - name: Install dependencies and linters
         run: |
           pip install pipenv
-
-      - name: Install dependencies
-        run: |
-          pipenv install && pip install flake8
+          pipenv install --dev
 
       - name: Run lint
         run: |
-          pipenv run lint
+          pipenv run flake8 .
 
   test:
-    name: Backend run test
+    name: Backend Testing
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -60,67 +57,11 @@ jobs:
         with:
           python-version: ${{env.PYTHON_VERSION}}
 
-      - name: Install pipenv
-        run: |
-          pip install pipenv
-
       - name: Install dependencies
         run: |
-          pipenv install
+          pip install pipenv
+          pipenv install --dev
 
       - name: Run tests
         run: |
-          pipenv run test
-          
-  build:
-    name: Build & push image
-    runs-on: ubuntu-latest
-    needs: [lint, test]
-    defaults:
-      run:
-        working-directory: ./starter/backend
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{env.PYTHON_VERSION}}
-
-      - name: Install pipenv
-        run: |
-          pip install pipenv && pip install flake8
-
-      - name: Install dependencies
-        run: |
-          pipenv install
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-        with:
-          mask-password: "true"
-
-      - name: Build, Tag, and Push docker image
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPOSITORY: backend
-          IMAGE_TAG: latest
-        run: |
-          docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
-          docker images
-
-      - name: Cache Docker image
-        uses: actions/cache@v4
-        with:
-          path: ~/docker-cache
-          key: docker-${{ github.sha }}-backend
-          restore-keys: |
-            docker-${{ github.sha }}-
+          pipenv run pytest
