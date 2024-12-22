@@ -6,30 +6,73 @@ on:
     branches:
       - main
     paths:
-      - "starter/backend/**"
-
-env:
-  PYTHON_VERSION: 3.11
+      - 'starter/backend/**'
 
 jobs:
-  build:
-    name: Build and Push Docker Image
+  lint:
+    name: Backend Linting
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ./starter/backend
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{env.PYTHON_VERSION}}
+          python-version: '3.11'
+
+      - name: Install pipenv and flake8
+        run: |
+          pip install pipenv flake8
 
       - name: Install dependencies
         run: |
+          pipenv install --dev
+
+      - name: Run flake8 linting
+        run: |
+          pipenv run flake8 .
+
+  test:
+    name: Backend Testing
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./starter/backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pipenv
+        run: |
           pip install pipenv
-          pipenv install
+
+      - name: Install dependencies
+        run: |
+          pipenv install --dev
+
+      - name: Run tests
+        run: |
+          pipenv run pytest
+
+  build:
+    name: Build and Push Docker Image to Amazon ECR
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    defaults:
+      run:
+        working-directory: ./starter/backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -38,28 +81,34 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Login to Amazon ECR
+      - name: Amazon ECR Login
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-        with:
-          mask-password: "true"
 
-      - name: Build, Tag, and Push docker image to Amazon ECR
+      - name: Build, Tag, and Push Docker Image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: backend
-          IMAGE_TAG: latest
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
-          docker images
           docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
 
+      - name: Cache Docker Image
+        uses: actions/cache@v4
+        with:
+          path: ~/docker-cache
+          key: docker-${{ github.sha }}-backend
+          restore-keys: |
+            docker-${{ github.sha }}-
+
   deploy:
-    name: Deploy to EKS
+    name: Deploy to Kubernetes
     runs-on: ubuntu-latest
     needs: [build]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -69,8 +118,19 @@ jobs:
           aws-region: us-east-1
 
       - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name cluster
-
-      - name: Apply Kubernetes Configurations
         run: |
-          kubectl apply -f ./starter/backend/k8s
+          aws eks update-kubeconfig --name cluster
+
+      - name: Set Docker Image in Kubernetes Manifests
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: backend
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          curl -s https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh | bash
+          ./kustomize edit set image backend=$REGISTRY/$REPOSITORY:$IMAGE_TAG
+          ./kustomize build | kubectl apply -f ./starter/backend/k8s
+
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status deployment/backend
